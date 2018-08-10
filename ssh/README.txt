@@ -1,0 +1,1 @@
+Put private and public ssh key in this directory. Do not commit this folder!
