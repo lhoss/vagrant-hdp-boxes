@@ -1,0 +1,311 @@
+# Defines our Vagrant environment
+#
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+
+  management_count = 1
+  master_count = 2
+  worker_count = 3
+
+  ssh_pub_key = File.readlines("../ssh/id_rsa.pub").first.strip
+
+  config.vm.box_check_update = false
+
+  if Vagrant.has_plugin?("vagrant-vbguest")
+    config.vbguest.auto_update = false
+    config.vbguest.no_remote = true
+  end
+
+  if Vagrant.has_plugin?("vagrant-hostmanager")
+    config.hostmanager.enabled = false
+  end
+
+  if Vagrant.has_plugin?("vagrant-hosts")
+    config.vm.provision :hosts do |provisioner|
+      provisioner.autoconfigure = true
+      provisioner.sync_hosts = true
+      provisioner.add_localhost_hostnames = false
+
+      provisioner.imports = ['virtualbox']
+      provisioner.exports = {
+        'virtualbox' => [
+          ['@vagrant_private_networks', ['@vagrant_hostnames']],
+        ],
+      }
+    end
+  end
+
+  config.vm.provision :shell, :inline => "grep -q '#{ssh_pub_key}' ~/.ssh/authorized_keys || echo '#{ssh_pub_key}' >> ~/.ssh/authorized_keys", privileged: false
+
+  # create management node
+  config.vm.define "management.local" do |config|
+    config.vm.box = "centos/7"
+
+    config.vm.hostname = "management.local"
+    config.vm.define "management.local"
+    config.vm.network :private_network, ip: "192.168.2.10", hostsupdater: "skip"
+    config.vm.provider "virtualbox" do |vb|
+      vb.memory = "2048"
+      vb.name = "management.local"
+
+      vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    end
+  end
+
+  # create master node
+  (1..master_count).each do |i|
+    config.vm.define "master#{i}.local" do |config|
+      config.vm.box = "centos/7"
+
+      config.vm.hostname = "master#{i}.local"
+      config.vm.define "master#{i}.local"
+      config.vm.network :private_network, ip: "192.168.2.2#{i-1}", hostsupdater: "skip"
+      config.vm.provider "virtualbox" do |vb|
+        vb.memory = "8192"
+        vb.name = "master0#{i}.local"
+
+        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+      end
+    end
+  end
+
+  # slave
+  (1..worker_count).each do |i|
+    config.vm.define "worker#{i}.local" do |config|
+      config.vm.box = "centos/7"
+
+      config.vm.hostname = "worker#{i}.local"
+      config.vm.define "worker#{i}.local"
+      config.vm.network :private_network, ip: "192.168.2.3#{i-1}", hostsupdater: "skip"
+      config.vm.provider "virtualbox" do |vb|
+        vb.memory = "4096"
+	      vb.name = "worker0#{i}.local"
+
+        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+      end
+    end
+  end
+
+  # create repository node
+  config.vm.define "repository.local" do |config|
+    config.vm.box = "centos/7"
+
+    config.vm.hostname = "repository.local"
+    config.vm.define "repository.local"
+    config.vm.network :private_network, ip: "192.168.2.3", hostsupdater: "skip"
+    config.vm.provider "virtualbox" do |vb|
+      vb.memory = "1024"
+	    vb.name = "repository.local"
+
+      vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    end
+
+    if Vagrant.has_plugin?("vagrant-vbguest")
+      config.vbguest.auto_update = true
+    end
+
+    config.vm.provision "ansible_local" do |ansible|
+      ansible.install_mode = "pip_args_only"
+      ansible.pip_args = "ansible==2.3.2"
+      ansible.version = "2.3.2.0"
+      ansible.limit = ""
+      ansible.verbose = false
+      ansible.playbook = "/local-repository/main.yml"
+      ansible.extra_vars = {
+        cloud_name: "static"
+      }
+      ansible.host_vars = {
+        "repository.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "repository.local",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        }
+      }
+    end
+
+    config.vm.synced_folder "../local-repository", "/local-repository"
+    config.vm.synced_folder "../../../repo", "/var/www/html"
+  end
+
+  # create ansible node
+  config.vm.define "ansible.local" do |config|
+    config.vm.box = "centos/7"
+
+    config.vm.hostname = "ansible.local"
+    config.vm.define "ansible.local"
+    config.vm.network :private_network, ip: "192.168.2.2", hostsupdater: "skip"
+    config.vm.provider "virtualbox" do |vb|
+      vb.memory = "1024"
+      vb.name = "ansible.local"
+
+      vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    end
+
+    if Vagrant.has_plugin?("vagrant-vbguest")
+      config.vbguest.auto_update = true
+    end
+
+    config.vm.provision :shell, :inline  => 'rm -f ~/.ssh/id_rsa ~/.ssh/id_rsa.pub >/dev/null 2>&1', privileged: false
+    config.vm.provision "file", source: "../ssh/id_rsa", destination: "~/.ssh/id_rsa"
+    config.vm.provision "file", source: "../ssh/id_rsa.pub", destination: "~/.ssh/id_rsa.pub"
+    config.vm.provision :shell, :inline  => 'chmod 600 ~/.ssh/id_rsa ~/.ssh/id_rsa.pub', privileged: false
+
+    config.vm.provision "ansible_local" do |ansible|
+      ansible.install_mode = "pip_args_only"
+      ansible.pip_args = "pycparser functools32 pytz ansible==2.3.2"
+      ansible.version = "2.3.2.0"
+      ansible.limit = ""
+      ansible.verbose = false
+      ansible.playbook = "/ansible-hortonworks/playbooks/install_cluster.yml"
+      ansible.extra_vars = {
+        cloud_name: "static",
+        hdp_version: "2.6.3.0",
+        security: "mit-kdc",
+        repo_base_url: "http://repository.local",
+        config_recommendation_strategy: "ALWAYS_APPLY_DONT_OVERRIDE_CUSTOM_VALUES",
+        blueprint_dynamic: [
+          {
+            role: "hdp-masternode-01",
+            clients: [
+              "ZOOKEEPER_CLIENT",
+              "HDFS_CLIENT",
+              "YARN_CLIENT",
+              "MAPREDUCE2_CLIENT",
+              "TEZ_CLIENT",
+              "SLIDER",
+              "PIG",
+              "SQOOP",
+              "HBASE_CLIENT"
+            ],
+            services: [
+              "ZOOKEEPER_SERVER",
+              "NAMENODE",
+              "ZKFC",
+              "JOURNALNODE",
+              "RESOURCEMANAGER",
+              "APP_TIMELINE_SERVER",
+              "HBASE_MASTER",
+              "NIMBUS",
+              "DRPC_SERVER",
+              "STORM_UI_SERVER"
+            ]
+          },
+          {
+            role: "hdp-masternode-02",
+            clients: [
+              "ZOOKEEPER_CLIENT",
+              "HDFS_CLIENT",
+              "YARN_CLIENT",
+              "MAPREDUCE2_CLIENT",
+              "TEZ_CLIENT",
+              "SLIDER",
+              "PIG",
+              "SQOOP",
+              "HBASE_CLIENT"
+            ],
+            services: [
+              "ZOOKEEPER_SERVER",
+              "NAMENODE",
+              "ZKFC",
+              "JOURNALNODE",
+              "RESOURCEMANAGER",
+              "HBASE_MASTER"
+            ]
+          },
+          {
+            role: "hdp-management",
+            clients: [
+              "ZOOKEEPER_CLIENT",
+              "HDFS_CLIENT",
+              "YARN_CLIENT",
+              "MAPREDUCE2_CLIENT",
+              "TEZ_CLIENT",
+              "SLIDER",
+              "PIG",
+              "SQOOP",
+              "HBASE_CLIENT"
+            ],
+            services: [
+              "AMBARI_SERVER",
+              "JOURNALNODE"
+            ]
+          },
+          {
+            role: "hdp-worker",
+            clients: [
+              "ZOOKEEPER_CLIENT",
+              "HDFS_CLIENT",
+              "YARN_CLIENT",
+              "MAPREDUCE2_CLIENT",
+              "TEZ_CLIENT",
+              "SLIDER",
+              "PIG",
+              "SQOOP",
+              "HBASE_CLIENT"
+            ],
+            services: [
+              "DATANODE",
+              "NODEMANAGER",
+              "HBASE_REGIONSERVER",
+              "SUPERVISOR"
+            ]
+          }
+        ]
+      }
+      ansible.host_vars = {
+        "repository.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "repository.local",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        },
+        "ansible.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "ansible.local",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        },
+        "master1.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "master1.local",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        },
+        "master2.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "master2.local",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        },
+        "management.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "management.local",
+          "ambari_server"=> "true",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        },
+        "worker1.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "worker1.local",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        },
+        "worker2.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "worker2.local",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        },
+        "worker3.local" => {
+          "ansible_user" => "vagrant",
+          "ansible_host" => "worker3.local",
+          "ansible_ssh_private_key_file" => "~/.ssh/id_rsa"
+        }
+      }
+      ansible.groups = {
+        "hdp-masternode-01" => ["master1.local"],
+        "hdp-masternode-02" => ["master2.local"],
+        "hdp-management" => ["management.local"],
+        "hdp-worker" => ["worker[1:#{worker_count}].local"],
+      }
+    end
+
+    config.vm.synced_folder "../ansible-hortonworks", "/ansible-hortonworks"
+  end
+
+end
